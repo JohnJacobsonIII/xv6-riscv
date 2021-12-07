@@ -8,6 +8,11 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct ringbuf; // TODO: is this needed?
+struct book;    // TODO: likewise
+
+// ringbuf.c
+uint64          sys_ringbuf(void);
 
 // bio.c
 void            binit(void);

@@ -337,49 +337,6 @@ uvmclear(pagetable_t pagetable, uint64 va)
   *pte &= ~PTE_U;
 }
 
-// asg2 memcpy implementation
-// TODO: DOC
-void*
-faster_memcopy(void *dst, const void *src, uint n)
-{
-  typedef uint64 __attribute__((__may_alias__)) u64;
-
-  unsigned char *d = dst;
-  const unsigned char *s = src;
-
-  //printf("start memcpy (n): %d\n", n);
-
-  // 8-byte align src pointer
-  for(;((u64)s % 8 > 0) && (n > 0);n--) *d++ = *s++;
-  //printf("source aligned\n");
-
-  // dst is 8-byte aligned, easy direcy copy
-  if((u64)d % 8 == 0) {
-    //printf("fast path (n): %d\n", n);
-    for(;n>=64;d+=64, s+=64, n-=64) {
-      //printf("fast loop (n,d,s): %d,%c,%c", n, *d, *s);
-      *(u64 *)(d+0) = *(u64 *)(s+0);
-      *(u64 *)(d+8) = *(u64 *)(s+8);
-      *(u64 *)(d+16) = *(u64 *)(s+16);
-      *(u64 *)(d+24) = *(u64 *)(s+24);
-      *(u64 *)(d+32) = *(u64 *)(s+32);
-      *(u64 *)(d+40) = *(u64 *)(s+40);
-      *(u64 *)(d+48) = *(u64 *)(s+48);
-      *(u64 *)(d+56) = *(u64 *)(s+56);
-    } // just dump to byte-wise for whatever is left
-  }
-  //printf("start slow copy\n");
-  // alignment is off, but I guess we don't need to accomodate this?
-  // Would just need 7 cases to byte align source and dest through 
-  //   intermediate values
-
-  // just do bytewise copy for anything left over
-  memmove(d, s, n);
-
-  //printf("done memcpy\n");
-  return dst;
-}
-
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
@@ -396,7 +353,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
-    faster_memcopy((void *)(pa0 + (dstva - va0)), src, n);
+    memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
     src += n;
@@ -421,7 +378,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
     n = PGSIZE - (srcva - va0);
     if(n > len)
       n = len;
-    faster_memcopy(dst, (void *)(pa0 + (srcva - va0)), n);
+    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
 
     len -= n;
     dst += n;
