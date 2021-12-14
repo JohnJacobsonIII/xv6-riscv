@@ -33,49 +33,14 @@
 
 // Contents of the header block, used for both the on-disk header block
 // and to keep track in memory of logged block# before commit.
-// 
-// [This is probably unnecessary and missing something easy, but the best
-// I came up with for enforcing order of commits.]
-//
-// seq_nbr is an int between 0 and LOGCOPIES (inclusive) attached to each
-// logheader. The idea is to treat seq_nbr as a ring of LOGCOPIES+1 entries,
-// each being a committed log entry, and viewing the block of committed logs
-// as a sliding window within the seq_nbr ring. Since committed entries 
-// must be consecutive, we can identify next-to-commit on recovery by
-// finding the lowest marked index in this ring
-//
-//
-// For this setup with 4 copies, if two logs (in logs.logs) are in the committed
-// state with seq_nbr 2 and 3 respectively, our view is as follows:
-//
-//  [ 0 | 0 | 1 | 1 | 0 ]
-// 
-// indicating that the first log to commit is that with seq_nbr 2 (and there are
-// 2 logs waiting to be committed / installed.) Likewise
-//
-//  [ 1 | 0 | 1 | 1 | 1 ]
-// 
-// indicates the same (to commit a log with seq_nbr 2 first,) although there are 4 logs 
-// awaiting commit here.
-//
-// There is not necessarily a relationship between seq_nbr and logs.logs index, seq_nbr's 
-// must be tracked (or scanned on recover) to determine this sequencing.
-//
-// invariant: only 4 committed logs - should be maintained by logs.copies_committed, since begin_op 
-// sleeps when this field is 4.
-//
-// invariant: committed logs consecutive - should be maintained by above and 
-// by avoiding races on logs.active (so it is only ever incremented when a log is ready to commit.)
-#define MAX_SEQ_NBR (LOGCOPIES+1)
-
 struct logheader {
   int n;
   int block[LOGSIZE];
-  int seq_nbr;
 };
 
 struct log {
   struct spinlock lock;
+  int id;
   int start;
   int size;
   int outstanding; // how many FS sys calls are executing.
@@ -90,7 +55,6 @@ struct logs {
   struct spinlock lock;
   int active;                // active log for writing
   int copies_committed;      // number of logs in committed status
-  int seq_nbr;               // current seq_nbr
 };
 struct logs logs;
 
@@ -109,14 +73,11 @@ initlog(int dev, struct superblock *sb)
 
   acquire(&logs.lock);
   for(int i=0;i<LOGCOPIES;i++){
-    struct log log;
-    initlock(&log.lock, "log");
-    log.size = sb->nlog / LOGCOPIES;
-    log.start = sb->logstart + (i * log.size);
-    log.dev = dev;
-    log.lh.seq_nbr = -1; // TODO: add checks for this
-
-    logs.logs[i] = log;
+    initlock(&logs.logs[i].lock, "log");
+    logs.logs[i].size = sb->nlog / LOGCOPIES;
+    logs.logs[i].start = sb->logstart + (i * logs.logs[i].size);
+    logs.logs[i].dev = dev;
+    logs.logs[i].id = i;
   }
   release(&logs.lock); 
 
@@ -127,6 +88,7 @@ initlog(int dev, struct superblock *sb)
 static void
 install_trans(int recovering, int lognum)
 {
+  //printf("install trans\n");
   int tail;
 
   struct log *log = &logs.logs[lognum];
@@ -141,6 +103,7 @@ install_trans(int recovering, int lognum)
     brelse(lbuf);
     brelse(dbuf);
   }
+  //printf("end install trans\n");
 }
 
 // Read the log header from disk into the in-memory log header
@@ -153,7 +116,6 @@ read_head(void)
 
   // read all log copies sequentially.
   // will only be read on a recover, so no need for granularity.
-  acquire(&logs.lock);
   for (int lognum = 0; lognum < LOGCOPIES; lognum++) {
     log = &logs.logs[lognum];
     
@@ -161,13 +123,11 @@ read_head(void)
     lh = (struct logheader *) (buf->data);
     
     log->lh.n = lh->n;
-    log->lh.seq_nbr = lh->seq_nbr;
     for (i = 0; i < log->lh.n; i++) {
       log->lh.block[i] = lh->block[i];
     }
     brelse(buf);
   }
-  release(&logs.lock);
 }
 
 // Write in-memory log header to disk.
@@ -177,6 +137,7 @@ read_head(void)
 static void
 write_head(int lognum)
 {
+  //printf("write head\n");
   struct log *log;
   log = &logs.logs[lognum];
   
@@ -191,83 +152,14 @@ write_head(int lognum)
   }
   bwrite(buf);
   brelse(buf);
-}
-
-// Searches sequence numbers to find the first log
-// index available for commit.
-// Only used on recovery, so performance shouldn't be
-// critical.
-int
-find_first_commit() {
-  int first_idx = -1;
-  int i;
-
-  if(logs.logs[0].lh.n == 0){ // no wrapping, get smallest idx
-    for(i=0;i<LOGCOPIES;i++){
-      if(logs.logs[i].lh.n > 0){
-        first_idx = i;
-	break;
-      }
-    }
-    // must have all empty logs, so start fresh.
-    if(first_idx < 0){
-      first_idx = 0;
-    }
-  } else { // either wraps, or all logs committed awaiting install
-    for(i=LOGCOPIES-1;i>0;i--){
-      // invariant: index 0 is committed, so search backwards
-      if(logs.logs[i].lh.n == 0){
-        first_idx = (i+1) % MAX_SEQ_NBR;
-	break;
-      }
-    }
-  }
-  // if we haven't set a start yet, all logs are committed.
-  // revert to seq_nbr to find first.
-  // a gap of 2 should separate last and first entry.
-  int next_log;
-  if(first_idx < 0){
-    for(i=0;i<LOGCOPIES;i++){
-      next_log = (i+1) % LOGCOPIES;
-      if(logs.logs[i].lh.seq_nbr + 1!= logs.logs[next_log].lh.seq_nbr){
-        first_idx = next_log;
-	break;
-      }
-    }
-  }
-
-  if(first_idx<0){
-    panic("find first commit");
-  }
-
-  return first_idx;
+  //printf("end write head\n");
 }
 
 static void
 recover_from_log(void)
 {
-  read_head(); // reads all logs.
-
-  // Below comment block should be unneeded, just start
-  // in the right place and install everything
-
-  // Don't think I need lock since probably no process can
-  // start logging until this is done.
-  // acquire(&logs.lock);
-
-  //for(lognum = 0; lognum < LOGCOPIES; lognum++){
-  //  log = &logs.logs[lognum];
-  //  if(log->lh.n > 0){
-  //    logs.copies_committed += 1;
-  //  }
-  //}
-  // release(&logs.lock);
-
-  // use find_next_commit to get starting point, then 
-  // install everything sequentially.
-  int lognum;
-  for(int i = find_first_commit();i < LOGCOPIES;i++){
-    lognum = i % LOGCOPIES;
+  read_head(); // reads all logs. only one should be on disk at any time.
+  for(int lognum = 0;lognum < LOGCOPIES;lognum++){
     install_trans(1, lognum); // if committed, copy from log to disk
     logs.logs[lognum].lh.n = 0;
     write_head(lognum); // clear the log
@@ -278,29 +170,28 @@ recover_from_log(void)
 void
 begin_op(void)
 {
+  //printf("begin_op\n");
   struct log *log; 
-  acquire(&logs.lock);
-  while(logs.copies_committed == 4){ // All logs committing, sleep
-    sleep(&logs, &logs.lock);
-  }
-  // if this lock is acquired, logs.copies_committed cannot
-  // ever be 4 since we also hold logs.lock
-  log = &logs.logs[logs.active];
-  acquire(&log->lock);
+  
   while(1){
+    log = &logs.logs[logs.active];
+    acquire(&log->lock);
     if(log->committing){ // Move to next log
-      logs.active = (logs.active + 1) % LOGCOPIES;
+      sleep(&log,&log->lock);
     } else if(log->lh.n + (log->outstanding+1)*MAXOPBLOCKS > LOGSIZE){
       // this op might exhaust log space; just move to next.
-      logs.active = (logs.active + 1) % LOGCOPIES;
+      sleep(&log,&log->lock);
+    } else if(logs.copies_committed == LOGCOPIES) {
+      sleep(&log,&log->lock);
     } else {
+      //printf("incr outstanding: id %d outstanding %d\n", log->id, log->outstanding);
       log->outstanding += 1;
       release(&log->lock);
-      release(&logs.lock);
       break;
     }
-    log = &logs.logs[logs.active];
+    release(&log->lock);
   }
+  //printf("end begin_op\n");
 }
 
 // called at the end of each FS system call.
@@ -308,20 +199,26 @@ begin_op(void)
 void
 end_op(void)
 {
+  //printf("end_op\n");
   int to_commit = -1;
 
   acquire(&logs.lock);
   struct log *log = &logs.logs[logs.active];
   
   acquire(&log->lock);
+  //printf("decr outstanding: id %d outstanding %d\n", log->id, log->outstanding);
   log->outstanding -= 1;
   if(log->committing)
     panic("log.committing");
   if(log->outstanding == 0){
     to_commit = logs.active;
+    logs.active = (logs.active + 1) % LOGCOPIES;
+    //printf("active log %d\n", logs.active);
     log->committing = 1;
-    log->lh.seq_nbr = logs.seq_nbr++;
     logs.copies_committed += 1;
+
+    //printf("wake %d\n", log->id);
+    wakeup(&log);
   }
   release(&log->lock);
   release(&logs.lock);
@@ -329,7 +226,7 @@ end_op(void)
   if(to_commit >= 0){
     // first be sure this is the right log to commit next
     acquire(&logs.lock);
-    while(log->lh.seq_nbr + logs.copies_committed != logs.seq_nbr){
+    while((log->id + logs.copies_committed) % LOGCOPIES != logs.active){
       sleep(&logs,&logs.lock); 
     }
     release(&logs.lock);
@@ -342,17 +239,21 @@ end_op(void)
 
     log->committing = 0;
     logs.copies_committed -= 1;
+    //printf("wake %d\n", log->id);
+    wakeup(&log);
     wakeup(&logs);
     
     release(&log->lock);
     release(&logs.lock);
   }
+  //printf("end end_op\n");
 }
 
 // Copy modified blocks from cache to log.
 static void
 write_log(int lognum)
 {
+  //printf("write log\n");
   // does this need a lock? intuitively no, but need to think...
   struct log *log = &logs.logs[lognum];
   int tail;
@@ -365,14 +266,16 @@ write_log(int lognum)
     brelse(from);
     brelse(to);
   }
+  //printf("end write log\n");
 }
 
 static void
 commit(int lognum)
 {
+  //printf("commit\n");
   // does this need a lock? intuitively no, but need to think...
   struct log *log = &logs.logs[lognum];
-  
+
   if (log->lh.n > 0) {
     write_log(lognum);     // Write modified blocks from cache to log
     write_head(lognum);    // Write header to disk -- the real commit
@@ -380,6 +283,7 @@ commit(int lognum)
     log->lh.n = 0;
     write_head(lognum);    // Erase the transaction from the log
   }
+  //printf("end commit\n");
 }
 
 // Caller has modified b->data and is done with the buffer.
@@ -394,13 +298,8 @@ commit(int lognum)
 void
 log_write(struct buf *b)
 {
+  //printf("log_write\n");
   int i;
-
-  // is a lock needed? we are modifying the log, 
-  // but it's protected by its own lock
-  // think lock is needed to ensure active log
-  // isn't changed mid write.
-  acquire(&logs.lock);
   struct log *log = &logs.logs[logs.active];
   
   acquire(&log->lock);
@@ -419,6 +318,6 @@ log_write(struct buf *b)
     log->lh.n++;
   }
   release(&log->lock);
-  release(&logs.lock);
+  //printf("end log_write\n");
 }
 
